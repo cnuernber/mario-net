@@ -10,7 +10,8 @@
             [cortex.core :as core]
             [cortex.protocols :as cp]
             [clojure.core.matrix.macros :refer [c-for]])
-  (:import [java.awt.image BufferedImage]))
+  (:import [java.awt.image BufferedImage])
+  (:gen-class))
 
 
 
@@ -100,9 +101,9 @@
                                                 (desc/linear input-size)])
         optimizer (opt/adadelta-optimiser (core/parameter-count network))
         loss-fn (opt/mse-loss)
-        network (net/train-until-error-stabilizes
+        network (net/train
                  network optimizer loss-fn
-                 input input 5 input input)
+                 input input 5 10 input input)
         ;;drop the noise and the decoder
         min-network (assoc network :modules (vec (drop 1 (drop-last (:modules network)))))
         next-data (net/run min-network input)
@@ -141,9 +142,9 @@
         loss-fn (opt/mse-loss)
         network (layers->full-network layers input-size true)
         optimizer (opt/adadelta-optimiser (core/parameter-count network))
-        network (net/train-until-error-stabilizes
+        network (net/train
                  network optimizer loss-fn
-                 input input 5 input input)
+                 input input 5 10 input input)
         front-half (* 2 (count layers))
         ;;drop the noise layer
         modules (drop 1 (:modules network))
@@ -161,19 +162,26 @@
 (def stacked-network (atom nil))
 (def full-network (atom nil))
 
+
+
 (defn train-autoencoder-network
-  []
-  (let [scaled-image (imagez/scale (main-image) 0.25)
-        data (image-to-mean-stddev-and-input-vectors scaled-image)
-        layers (reduce (fn [layers layer-size]
-                         (let [input-data (or (:next-input (last layers))
-                                              (:input-vectors data))]
-                           (conj layers (train-autoencoder-layer input-data layer-size))))
-                       []
-                       autoencoder-layer-sizes)
-        _ (reset! stacked-network layers)
-        layers (train-full-encoder-decoder-network (:input-vectors data) layers)]
-    (assoc data :layers layers :scaled-image scaled-image)))
+  ([data layer-sizes]
+   (let [layers (reduce (fn [layers layer-size]
+                          (let [input-data (or (:next-input (last layers))
+                                               data)]
+                            (conj layers (train-autoencoder-layer input-data layer-size))))
+                        []
+                        layer-sizes)
+         _ (reset! stacked-network layers)
+         layers (train-full-encoder-decoder-network data layers)]
+     (reset! full-network layers)
+     layers))
+
+  ([] (let [scaled-image (imagez/scale (main-image) 0.25)
+            data (image-to-mean-stddev-and-input-vectors scaled-image)
+            layers
+            (train-autoencoder-network (:input-vectors data) autoencoder-layer-sizes)]
+        (assoc data :layers layers :scaled-image scaled-image))))
 
 
 ;;render the right-most column, copy into the data store and render the next
@@ -230,8 +238,10 @@
                        [{} []]
                        (range output-pixel-count))
         [item-map output-pixels] retval
-        output-pixels (m/array :vectorz (mapv vec (partition output-width output-pixels)))]
-    {:item-map item-map :pixels output-pixels}))
+        output-ary (m/array :vectorz (mapv vec (partition output-width output-pixels)))
+        ]
+
+    {:item-map item-map :pixels output-ary}))
 
 
 (defn indexed-squares-to-image
@@ -264,3 +274,183 @@
            (aset input-pixels input-addr input-val))))))
     (imagez/set-pixels retval input-pixels)
     retval))
+
+(def column-data-count 2)
+
+
+(defn build-square-training-data
+  "Build a dataset that given two columns and an index, output the item in
+the third column"
+  [square-size]
+  (let [indexed-data (image-to-indexed-squares (main-image) square-size)
+        column-data (m/transpose (:pixels indexed-data))
+        output-count (count (:item-map indexed-data))
+        column-height (m/column-count column-data)
+        num-columns (m/row-count column-data)
+
+        zero-vec (vec (repeat output-count 0.0))
+        mat-vec (m/as-vector column-data)
+        valid-column-indexes (- num-columns column-data-count)
+        block-size (* column-data-count column-height)
+        data-label-seq (mapcat identity
+                               (for [col-idx (range valid-column-indexes)]
+                                 (let [data-vec (m/subvector mat-vec (* col-idx column-height)
+                                                             block-size)]
+                                   (for [idx (range column-height)]
+                                     [(m/array :vectorz (concat (m/eseq data-vec) [idx]))
+                                      (m/array :vectorz (assoc zero-vec
+                                                               (int (m/mget
+                                                                     data-vec
+                                                                     (+ (*
+                                                                         (- column-data-count 1)
+                                                                         column-height) idx)))
+                                                               1.0))]))))
+        training-data (mapv first data-label-seq)
+        training-labels (mapv second data-label-seq)]
+    {:indexed-squares indexed-data :column-data column-data
+     :training-data training-data :training-labels training-labels
+     :data-and-labels data-label-seq}))
+
+
+(defn even-training-data-distribution
+  [training-data training-labels item-sample-count]
+  (let [groups (group-by second (map vector training-data training-labels))
+        data-and-labels (mapcat identity (for [[key item-vec] groups]
+                                           (let [item-count (count item-vec)
+                                                 indexes (vec
+                                                          (shuffle (range (count item-vec))))]
+                                             (for [idx (range item-sample-count)]
+                                               (let [local-idx (rem idx item-count)]
+                                                 (item-vec (indexes local-idx)))))))
+        training-data (mapv first data-and-labels)
+        training-labels (mapv second data-and-labels)]
+    [training-data training-labels]))
+
+
+(defn create-network-scaler
+  [square-data]
+  (let [indexed-squares (:indexed-squares square-data)
+        item-count (count (:item-map indexed-squares))
+        column-count (long (m/column-count (:column-data square-data)))]
+    (m/array :vectorz (concat (repeat (* column-count column-data-count)
+                                      (/ 1.0 item-count))
+                              [(/ 1.0 column-count)]))))
+
+
+(defn train-square-training-network
+  [square-size]
+  (let [square-data (build-square-training-data square-size)
+        output-size (m/ecount (first (:training-labels square-data)))
+        input-size (m/ecount (first (:training-data square-data)))
+        data-size (count (:training-labels square-data))
+        indexes (shuffle (range data-size))
+        training-count (int (* 0.8 data-size))
+        training-indexes (take training-count indexes)
+        cv-indexes (drop training-count indexes)
+        network-scale (create-network-scaler square-data)
+        all-training-data (mapv #(m/mul % network-scale) (:training-data square-data))
+        training-data (mapv all-training-data training-indexes)
+        training-labels (mapv (:training-labels square-data) training-indexes)
+        [training-data training-labels] (even-training-data-distribution
+                                         training-data training-labels 1000)
+        _ (println (count training-data) (first training-data))
+        cv-data (mapv all-training-data cv-indexes)
+        cv-labels (mapv (:training-labels square-data) cv-indexes)
+        layer-sizes [200 100]
+        network (desc/build-and-create-network [(desc/input input-size)
+                                                (mapcat (fn [layer-size]
+                                                          (desc/linear->logistic layer-size))
+                                                        layer-sizes)
+                                                (desc/softmax output-size)])
+        loss-fn (opt/->CrossEntropyLoss)
+        optimizer (opt/adadelta-optimiser (core/parameter-count network))
+        network (net/train network optimizer loss-fn
+                           training-data training-labels
+                           5 20
+                           cv-data cv-labels)]
+    {:network network :square-data square-data}))
+
+
+(defn network-output-to-index
+  [output-vec]
+  (let [num-output (long (m/ecount output-vec))
+        last-valid (- num-output 1)]
+    (loop [max-prob 0.0
+           max-idx 0
+           idx 0]
+      (if (< idx num-output)
+        (let [prob (m/mget output-vec idx)
+              [max-prob max-idx] (if (> prob max-prob)
+                                   [prob idx]
+                                   [max-prob max-idx])]
+
+          (recur max-prob max-idx (inc idx)))
+        [max-idx output-vec]))))
+
+(defn check-data-and-label
+  [data label]
+  (let [elem-count (long (m/ecount data))
+        col-count (quot elem-count
+                        2)
+        index-idx (- elem-count 1)
+        index (int (m/mget data index-idx))
+        answer (double (first (network-output-to-index label)))
+        value (m/mget data (+ col-count index))]
+    (= answer value)))
+
+(defn verify-training-data
+  [training-data training-labels]
+  (let [data-and-labels (mapv vector training-data training-labels)]
+    (remove (fn [[data label]]
+              (check-data-and-label data label))
+            data-and-labels)))
+
+
+(defn draw-network-square
+  [input-vec idx network]
+  (let [real-input (m/array :vectorz (concat (m/eseq input-vec) [idx]))
+        network (cp/forward network real-input)]
+    (first (network-output-to-index (cp/output network)))))
+
+
+(defn draw-network-column
+  [input-vec scale-vec column-height network]
+  (let [real-input (m/array :vectorz (concat (m/eseq input-vec) [0.0]))
+        index-idx (- (m/ecount real-input) 1)
+        column-data (for [col (range column-height)]
+                      (do
+                        (m/mset! real-input index-idx (double col))
+                        (let [network (cp/forward network (m/mul real-input scale-vec))]
+                          (first (network-output-to-index (cp/output network))))))]
+    (vec column-data)))
+
+
+(defn draw-image
+  [network-and-data column-count]
+  (let [network (:network network-and-data)
+        square-data (:square-data network-and-data)
+        {:keys [indexed-squares column-data training-data training-labels]} square-data
+        input-vec (m/array :vectorz (drop-last (m/eseq
+                                                (first training-data))))
+        column-height (m/column-count column-data)
+        scale-vec (create-network-scaler square-data)
+        results (mapv vec (partition column-height (m/eseq input-vec)))
+        results
+        (reduce (fn [results col-idx]
+                  (let [new-column (draw-network-column input-vec
+                                                        scale-vec
+                                                        column-height network)]
+                    (m/assign! (m/subvector input-vec 0 column-height)
+                               (m/subvector input-vec column-height column-height))
+                    (m/assign! (m/subvector input-vec column-height column-height)
+                               new-column)
+                    (conj results new-column)))
+                results
+                (range column-count))
+        output-mat (m/transpose (m/array :vectorz results))]
+    (indexed-squares-to-image (assoc indexed-squares :pixels output-mat))))
+
+
+(defn -main
+  [& args]
+  (train-autoencoder-network))
