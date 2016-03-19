@@ -352,8 +352,7 @@ the third column"
         training-data (mapv all-training-data training-indexes)
         training-labels (mapv (:training-labels square-data) training-indexes)
         [training-data training-labels] (even-training-data-distribution
-                                         training-data training-labels 1000)
-        _ (println (count training-data) (first training-data))
+                                         training-data training-labels 2000)
         cv-data (mapv all-training-data cv-indexes)
         cv-labels (mapv (:training-labels square-data) cv-indexes)
         layer-sizes [200 100]
