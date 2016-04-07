@@ -238,9 +238,7 @@
                        [{} []]
                        (range output-pixel-count))
         [item-map output-pixels] retval
-        output-ary (m/array :vectorz (mapv vec (partition output-width output-pixels)))
-        ]
-
+        output-ary (m/array :vectorz (mapv vec (partition output-width output-pixels)))]
     {:item-map item-map :pixels output-ary}))
 
 
@@ -275,7 +273,7 @@
     (imagez/set-pixels retval input-pixels)
     retval))
 
-(def column-data-count 2)
+(def column-data-count 1)
 
 
 (defn build-square-training-data
@@ -284,27 +282,25 @@ the third column"
   [square-size]
   (let [indexed-data (image-to-indexed-squares (main-image) square-size)
         column-data (m/transpose (:pixels indexed-data))
-        output-count (count (:item-map indexed-data))
+        columns (vec (m/rows column-data))
         column-height (m/column-count column-data)
         num-columns (m/row-count column-data)
-
+        output-count (count (:item-map indexed-data))
+        input-column-count (+ column-data-count 1)
+        input-count (+ (* input-column-count column-height) 1)
         zero-vec (vec (repeat output-count 0.0))
         mat-vec (m/as-vector column-data)
         valid-column-indexes (- num-columns column-data-count)
-        block-size (* column-data-count column-height)
         data-label-seq (mapcat identity
                                (for [col-idx (range valid-column-indexes)]
-                                 (let [data-vec (m/subvector mat-vec (* col-idx column-height)
-                                                             block-size)]
+                                 (let [data-column (columns col-idx)
+                                       guess-column (columns (+ col-idx 1))]
                                    (for [idx (range column-height)]
-                                     [(m/array :vectorz (concat (m/eseq data-vec) [idx]))
-                                      (m/array :vectorz (assoc zero-vec
-                                                               (int (m/mget
-                                                                     data-vec
-                                                                     (+ (*
-                                                                         (- column-data-count 1)
-                                                                         column-height) idx)))
-                                                               1.0))]))))
+                                     (let [data (map-indexed #(if (<= %1 idx) -1 %2) guess-column)]
+                                      [(m/array :vectorz (concat (m/eseq data-column) data))
+                                       (m/array :vectorz (assoc zero-vec
+                                                                (int (m/mget guess-column idx))
+                                                                1.0))])))))
         training-data (mapv first data-label-seq)
         training-labels (mapv second data-label-seq)]
     {:indexed-squares indexed-data :column-data column-data
@@ -312,29 +308,13 @@ the third column"
      :data-and-labels data-label-seq}))
 
 
-(defn even-training-data-distribution
-  [training-data training-labels item-sample-count]
-  (let [groups (group-by second (map vector training-data training-labels))
-        data-and-labels (mapcat identity (for [[key item-vec] groups]
-                                           (let [item-count (count item-vec)
-                                                 indexes (vec
-                                                          (shuffle (range (count item-vec))))]
-                                             (for [idx (range item-sample-count)]
-                                               (let [local-idx (rem idx item-count)]
-                                                 (item-vec (indexes local-idx)))))))
-        training-data (mapv first data-and-labels)
-        training-labels (mapv second data-and-labels)]
-    [training-data training-labels]))
-
-
 (defn create-network-scaler
   [square-data]
   (let [indexed-squares (:indexed-squares square-data)
         item-count (count (:item-map indexed-squares))
         column-count (long (m/column-count (:column-data square-data)))]
-    (m/array :vectorz (concat (repeat (* column-count column-data-count)
-                                      (/ 1.0 item-count))
-                              [(/ 1.0 column-count)]))))
+    (m/array :vectorz (repeat (* column-count (+ column-data-count 1))
+                              (/ 1.0 item-count)))))
 
 
 (defn train-square-training-network
@@ -351,8 +331,6 @@ the third column"
         all-training-data (mapv #(m/mul % network-scale) (:training-data square-data))
         training-data (mapv all-training-data training-indexes)
         training-labels (mapv (:training-labels square-data) training-indexes)
-        [training-data training-labels] (even-training-data-distribution
-                                         training-data training-labels 2000)
         cv-data (mapv all-training-data cv-indexes)
         cv-labels (mapv (:training-labels square-data) cv-indexes)
         layer-sizes [200 100]
@@ -360,12 +338,12 @@ the third column"
                                                 (mapcat (fn [layer-size]
                                                           (desc/linear->logistic layer-size))
                                                         layer-sizes)
-                                                (desc/softmax output-size)])
+                                                (desc/linear->softmax output-size)])
         loss-fn (opt/->CrossEntropyLoss)
-        optimizer (opt/adadelta-optimiser (core/parameter-count network))
+        optimizer (opt/adam)
         network (net/train network optimizer loss-fn
                            training-data training-labels
-                           5 20
+                           5 10
                            cv-data cv-labels)]
     {:network network :square-data square-data}))
 
@@ -429,11 +407,11 @@ the third column"
   (let [network (:network network-and-data)
         square-data (:square-data network-and-data)
         {:keys [indexed-squares column-data training-data training-labels]} square-data
-        input-vec (m/array :vectorz (drop-last (m/eseq
-                                                (first training-data))))
+        columns (vec (m/rows column-data))
+        input-vec 2
         column-height (m/column-count column-data)
         scale-vec (create-network-scaler square-data)
-        results (mapv vec (partition column-height (m/eseq input-vec)))
+        results (mapv vec (partition column-height (m/eseq columns)))
         results
         (reduce (fn [results col-idx]
                   (let [new-column (draw-network-column input-vec
